@@ -1,0 +1,527 @@
+/**
+ * Main Mobile Application Controller
+ * Handles initialization and coordination of all mobile app features
+ */
+
+console.log('🚀 Starting Mobile Campus Navigation...');
+
+// Resolve the first existing element id (desktop and mobile pages use
+// different ids for the same things).
+function byId(...ids) {
+    for (const id of ids) {
+        const el = document.getElementById(id);
+        if (el) return el;
+    }
+    return null;
+}
+
+// Global state
+let mapController = null;
+let navigationEngine = null;
+let isInitialized = false;
+let lastMentionedBuilding = null; // tracks last building shown/mentioned
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', async () => {
+    try {
+        console.log('📱 DOM loaded, initializing mobile app...');
+
+        // Initialize map controller (desktop uses #map-container, mobile #map)
+        const mapEl = byId('map', 'map-container');
+        if (!mapEl) throw new Error('No map container element found on this page');
+        mapController = new CampusMapController(mapEl.id);
+        await mapController.initialize();
+        
+        // Initialize navigation engine
+        navigationEngine = new CampusNavigationEngine();
+        await navigationEngine.initialize();
+        
+        // Setup chatbot
+        setupChatbot();
+        
+        // Setup chatbot toggle
+        setupChatbotToggle();
+        
+        // Hide loading overlay
+        hideLoadingOverlay();
+        
+        isInitialized = true;
+        console.log('✅ Mobile app initialized successfully!');
+        
+    } catch (error) {
+        console.error('❌ Initialization failed:', error);
+        hideLoadingOverlay();
+        addMessage('bot', 'Sorry, there was an error loading the navigation system. Please refresh the page.');
+    }
+});
+
+/**
+ * Setup chatbot functionality
+ */
+function setupChatbot() {
+    const userInput = byId('userInput', 'user-input');
+    const sendBtn = byId('sendBtn') || document.querySelector('.send-btn');
+
+    if (!userInput || !sendBtn) {
+        console.warn('⚠️ Chat input elements not found — chat disabled');
+        return;
+    }
+
+    // Send message on button click
+    sendBtn.addEventListener('click', () => {
+        sendMessage();
+    });
+    
+    // Send message on Enter key
+    userInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            sendMessage();
+        }
+    });
+}
+
+/**
+ * Setup chatbot toggle (minimize/maximize)
+ */
+function setupChatbotToggle() {
+    const chatToggle = document.getElementById('chatToggle');
+    const chatbotContainer = document.getElementById('chatbotContainer');
+    
+    if (chatToggle && chatbotContainer) {
+        chatToggle.addEventListener('click', () => {
+            chatbotContainer.classList.toggle('minimized');
+            // Force map to recalculate size
+            setTimeout(() => {
+                if (window.map) window.map.invalidateSize();
+            }, 350);
+        });
+    }
+}
+
+/**
+ * Send user message
+ */
+async function sendMessage() {
+    const userInput = byId('userInput', 'user-input');
+    if (!userInput) return;
+    const message = userInput.value.trim();
+    
+    if (!message) return;
+    
+    // Add user message to chat
+    addMessage('user', message);
+    userInput.value = '';
+    
+    // Show typing indicator
+    const typingId = addTypingIndicator();
+
+    // If user is following up on a previously shown building, navigate directly
+    // BUT only if they didn't mention a specific building in this message
+    if (lastMentionedBuilding && isFollowUpNavigation(message) && !containsBuildingName(message)) {
+        removeTypingIndicator(typingId);
+        showNavigation('Gate 1', lastMentionedBuilding);
+        return;
+    }
+
+    try {
+        // Send to chatbot API
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                message: message,
+                userLocation: (window.adminMode && window.adminMode.customLocation)
+                    ? window.adminMode.customLocation
+                    : (window.userGPSLocation || null)
+            })
+        });
+        
+        const data = await response.json();
+        
+        // Remove typing indicator
+        removeTypingIndicator(typingId);
+        
+        // Add bot response
+        addMessage('bot', data.response || 'Sorry, I couldn\'t understand that.');
+        
+        // Handle action from chatbot
+        if (data.action === 'navigate' && data.destination) {
+            lastMentionedBuilding = data.destination;
+            showNavigation(data.start || 'Gate 1', data.destination);
+        } else if (data.action === 'show_location' && data.location) {
+            lastMentionedBuilding = data.location;
+            showBuildingOnMap(data.location, data.display_name || null);
+            renderGetDirectionsChip(data.location);
+        } else if (data.action === 'ask_transport' && data.chips) {
+            // Render transport mode chips below the bot message
+            renderTransportChips(data.chips, data.nearest_gate);
+        } else if (data.destination) {
+            lastMentionedBuilding = data.destination;
+            showNavigation(data.start || 'Gate 1', data.destination);
+        }
+        
+    } catch (error) {
+        console.error('Chat error:', error);
+        removeTypingIndicator(typingId);
+        addMessage('bot', 'Sorry, there was an error processing your message.');
+    }
+}
+
+/**
+ * Add message to chat
+ */
+function addMessage(type, text) {
+    const chatMessages = document.getElementById('chatMessages') || document.getElementById('chat-messages');
+    if (!chatMessages) return;    
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${type}-message`;
+    
+    const avatar = document.createElement('div');
+    avatar.className = 'message-avatar';
+    avatar.innerHTML = type === 'bot' ? '<i class="fas fa-robot"></i>' : '<i class="fas fa-user"></i>';
+    
+    const content = document.createElement('div');
+    content.className = 'message-content';
+    if (type === 'bot') { content.innerHTML = text; } else { content.textContent = text; }    
+    if (type === 'user') {
+        messageDiv.appendChild(content);
+        messageDiv.appendChild(avatar);
+    } else {
+        messageDiv.appendChild(avatar);
+        messageDiv.appendChild(content);
+    }
+    
+    chatMessages.appendChild(messageDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+/**
+ * Add typing indicator
+ */
+function addTypingIndicator() {
+    const chatMessages = document.getElementById('chatMessages') || document.getElementById('chat-messages');
+    if (!chatMessages) return null;
+    
+    const typingDiv = document.createElement('div');
+    typingDiv.className = 'message bot-message typing-indicator';
+    typingDiv.id = 'typing-' + Date.now();
+    
+    const avatar = document.createElement('div');
+    avatar.className = 'message-avatar';
+    avatar.innerHTML = '<i class="fas fa-robot"></i>';
+    
+    const content = document.createElement('div');
+    content.className = 'message-content';
+    content.innerHTML = '<i class="fas fa-ellipsis-h"></i>';
+    
+    typingDiv.appendChild(avatar);
+    typingDiv.appendChild(content);
+    chatMessages.appendChild(typingDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    
+    return typingDiv.id;
+}
+
+/**
+ * Remove typing indicator
+ */
+function removeTypingIndicator(id) {
+    const indicator = document.getElementById(id);
+    if (indicator) {
+        indicator.remove();
+    }
+}
+
+/**
+ * Render a Get Directions chip after a building is shown on the map
+ */
+function renderGetDirectionsChip(buildingId) {
+    const chatMessages = document.getElementById('chatMessages') || document.getElementById('chat-messages');
+    if (!chatMessages) return;
+
+    const chipRow = document.createElement('div');
+    chipRow.style.cssText = 'display:flex;gap:8px;padding:4px 0 8px 42px;';
+
+    const btn = document.createElement('button');
+    btn.textContent = '🗺️ Get Directions';
+    btn.style.cssText = `
+        background: #006341;
+        border: none;
+        border-radius: 20px;
+        padding: 8px 18px;
+        font-size: 13px;
+        font-weight: 600;
+        color: white;
+        cursor: pointer;
+        transition: all 0.2s;
+        box-shadow: 0 2px 8px rgba(0,99,65,0.3);
+    `;
+    btn.onmouseover = () => { btn.style.background = '#004d30'; };
+    btn.onmouseout = () => { btn.style.background = '#006341'; };
+    btn.onclick = () => {
+        chipRow.remove();
+        // Minimize chat so user can see the full route
+        const chatbotContainer = document.getElementById('chatbotContainer');
+        if (chatbotContainer && !chatbotContainer.classList.contains('minimized')) {
+            chatbotContainer.classList.add('minimized');
+            setTimeout(() => { if (window.map) window.map.invalidateSize(); }, 350);
+        }
+        showNavigation('Gate 1', buildingId);
+    };
+
+    chipRow.appendChild(btn);
+    chatMessages.appendChild(chipRow);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+/**
+ * Render transport mode chips after a gate query
+ */
+function renderTransportChips(chips, nearestGate) {
+    const chatMessages = document.getElementById('chatMessages') || document.getElementById('chat-messages');
+    if (!chatMessages) return;
+
+    const chipRow = document.createElement('div');
+    chipRow.style.cssText = 'display:flex;gap:8px;padding:4px 0 8px 42px;flex-wrap:wrap;';
+    chipRow.id = 'transport-chips';
+
+    chips.forEach(chip => {
+        const btn = document.createElement('button');
+        btn.textContent = chip.label;
+        btn.style.cssText = `
+            background: rgba(0,99,65,0.08);
+            border: 1.5px solid rgba(0,99,65,0.3);
+            border-radius: 20px;
+            padding: 7px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #006341;
+            cursor: pointer;
+            transition: all 0.2s;
+        `;
+        btn.onmouseover = () => { btn.style.background = '#006341'; btn.style.color = 'white'; };
+        btn.onmouseout = () => { btn.style.background = 'rgba(0,99,65,0.08)'; btn.style.color = '#006341'; };
+
+        btn.onclick = () => {
+            // Remove chips after selection
+            const chipsEl = document.getElementById('transport-chips');
+            if (chipsEl) chipsEl.remove();
+
+            if (chip.value === 'on_foot') {
+                addMessage('user', '🚶 On foot');
+                // Find nearest pedestrian gate using location
+                const loc = (window.adminMode && window.adminMode.customLocation)
+                    ? window.adminMode.customLocation : null;
+                let pedestrianGate = 'Gate 1'; // default
+                if (loc && navigationEngine && navigationEngine.buildings) {
+                    const gates = ['Gate 1', 'Gate 3'];
+                    let minDist = Infinity;
+                    gates.forEach(g => {
+                        if (navigationEngine.buildings.has(g)) {
+                            const b = navigationEngine.buildings.get(g);
+                            const coords = b.coordinates;
+                            const dlat = (loc.lat - coords[0]) * 111320;
+                            const dlng = (loc.lng - coords[1]) * 111320 * Math.cos(coords[0] * Math.PI / 180);
+                            const dist = Math.sqrt(dlat * dlat + dlng * dlng);
+                            if (dist < minDist) { minDist = dist; pedestrianGate = g; }
+                        }
+                    });
+                }
+                addMessage('bot', `Got it! Routing you to ${pedestrianGate} — the nearest pedestrian gate.`);
+                showNavigation('Gate 1', pedestrianGate);
+            } else {
+                addMessage('user', '🚗 By vehicle');
+                addMessage('bot', `Got it! Routing you to ${nearestGate}.`);
+                showNavigation('Gate 1', nearestGate);
+            }
+        };
+
+        chipRow.appendChild(btn);
+    });
+
+    chatMessages.appendChild(chipRow);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+/**
+ * Focus map on a building without drawing a route
+ */
+function showBuildingOnMap(buildingId, displayName = null) {
+    if (!navigationEngine || !mapController) return;
+
+    // 🎓 Geofence: building reveals are an on-campus feature, like routing
+    const geoLoc = (window.adminMode && window.adminMode.customLocation) || window.userGPSLocation || null;
+    if (!geoLoc) {
+        console.log('🚫 Building reveal blocked: no verified location');
+        addMessage('bot', '📍 <b>Turn on GPS first</b> so Lakán can verify you are inside the DLSU-D campus — building locations are an on-campus feature.');
+        return;
+    }
+    if (window.isInsideCampus && !window.isInsideCampus(geoLoc.lat, geoLoc.lng)) {
+        console.log('🚫 Building reveal blocked: user is outside the campus geofence');
+        addMessage('bot', '🎓 <b>On-campus feature.</b> You appear to be outside DLSU-D, so building locations are hidden. Come visit us!');
+        return;
+    }
+
+    let coords = null;
+    let name = displayName || buildingId;
+
+    if (navigationEngine.buildings && navigationEngine.buildings.has(buildingId)) {
+        const b = navigationEngine.buildings.get(buildingId);
+        coords = b.coordinates;
+        if (!displayName) name = b.name || buildingId;
+    }
+
+    if (coords) {
+        mapController.clearRoute();
+        mapController.showLocation(coords, name);
+        // Minimize chatbot so map is visible
+        const chatbotContainer = document.getElementById('chatbotContainer');
+        if (chatbotContainer && !chatbotContainer.classList.contains('minimized')) {
+            chatbotContainer.classList.add('minimized');
+            setTimeout(() => { if (window.map) window.map.invalidateSize(); }, 350);
+        }
+    } else {
+        console.warn(`⚠️ No coordinates found for building: ${buildingId}`);
+    }
+}
+
+/**
+ * Check if message contains a known building name
+ */
+function containsBuildingName(text) {
+    if (!navigationEngine || !navigationEngine.buildings) return false;
+    const t = text.toLowerCase();
+    for (const [id] of navigationEngine.buildings) {
+        if (t.includes(id.toLowerCase())) return true;
+    }
+    return false;
+}
+
+/**
+ * Detect if the user is following up to navigate to the last mentioned building
+ */
+function isFollowUpNavigation(text) {
+    const t = text.toLowerCase();
+    const triggers = [
+        'how to go', 'how do i get', 'navigate me', 'take me there',
+        'go there', 'directions there', 'route there', 'get there',
+        'how to get there', 'navigate there', 'bring me there', 'lead me there'
+    ];
+    return triggers.some(trigger => t.includes(trigger));
+}
+
+function showNavigation(start, destination) {
+    console.log(`📍 Navigation: ${start} → ${destination}`);
+
+    // 🎓 Geofence: routing is an on-campus feature — requires a verified
+    // location (GPS or admin custom location) INSIDE the campus box.
+    const geoLoc = (window.adminMode && window.adminMode.customLocation) || window.userGPSLocation || null;
+    if (!geoLoc) {
+        console.log('🚫 Navigation blocked: no verified location');
+        addMessage('bot', '📍 <b>Turn on GPS first</b> so Lakán can verify you are inside the DLSU-D campus before navigating.');
+        return;
+    }
+    if (window.isInsideCampus && !window.isInsideCampus(geoLoc.lat, geoLoc.lng)) {
+        console.log('🚫 Navigation blocked: user is outside the campus geofence');
+        addMessage('bot', '🎓 <b>Navigation is on-campus only.</b> Your location appears to be outside DLSU-D. Come visit us!');
+        return;
+    }
+    
+    if (!navigationEngine || !mapController) {
+        console.error('Navigation engine or map controller not initialized');
+        return;
+    }
+    
+    try {
+        // Route from the user's actual verified location (admin pin or GPS).
+        // findShortestPath connects it to the nearest pathway nodes via a
+        // virtual user node — no more hard-coded Gate 1 starts.
+        const userStart = geoLoc;
+        let actualStart = userStart || start;
+        console.log(`🚩 Starting route from user location:`,
+            userStart ? [userStart.lat, userStart.lng] : start);
+        
+        // Clear previous route
+        mapController.clearRoute();
+        
+        // Find route using navigation engine
+        const route = navigationEngine.findShortestPath(actualStart, destination);
+        
+        if (route && route.coordinates) {
+            // Show route on map
+            mapController.drawRoute(route);
+            mapController.addStartEndMarkers(route);
+            mapController.fitToRoute(route);
+            const cancelBtn = document.getElementById('cancelNavBtn');
+            if (cancelBtn) cancelBtn.style.display = 'block';
+            const mins = route.estimatedTime || Math.ceil(route.totalDistance / 80);
+            const meters = route.totalDistance || 0;
+            const calories = Math.round(meters * 0.05);
+            const destName = route.endLocation?.name || destination;
+            addMessage('bot', `🗺️ Route found! About ${meters}m · ~${mins} min walk.`);
+
+            // Register arrival handler
+            window.onUserArrived = () => {
+                cancelNavigation();
+                addMessage('bot', `🎉 You have arrived at ${destName}!<br>📍 ${meters}m walked · ⏱️ ~${mins} min · 🔥 ${calories} kcal burned`);
+                window.onUserArrived = null;
+            };
+            
+            // Expand chatbot if minimized (element missing on the desktop
+            // page — this unguarded access threw after every successful
+            // route, printing a false "error showing the route")
+            const chatbotContainer = document.getElementById('chatbotContainer');
+            if (chatbotContainer && chatbotContainer.classList.contains('minimized')) {
+                chatbotContainer.classList.remove('minimized');
+            }
+        } else {
+            addMessage('bot', `Sorry, I couldn't find a route from your location to ${destination}.`);
+        }
+        
+    } catch (error) {
+        console.error('Navigation error:', error);
+        addMessage('bot', 'Sorry, there was an error showing the route.');
+    }
+}
+
+/**
+ * Cancel active navigation and clear the route from the map
+ */
+function cancelNavigation() {
+    if (mapController) {
+        mapController.clearRoute();
+    }
+    const cancelBtn = document.getElementById('cancelNavBtn');
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    window.onUserArrived = null;
+    addMessage('bot', '🗺️ Navigation cancelled.');
+}
+
+// Expose globally so the onclick in mobile_app.html can reach it
+window.cancelNavigation = cancelNavigation;
+
+/**
+ * Hide loading overlay
+ */
+function hideLoadingOverlay() {
+    const overlay = document.getElementById('loadingOverlay');
+    if (overlay) {
+        overlay.classList.add('hidden');
+        setTimeout(() => {
+            overlay.style.display = 'none';
+        }, 500);
+    }
+}
+
+// Expose functions globally for other modules
+window.mobileApp = {
+    addMessage,
+    showNavigation,
+    isInitialized: () => isInitialized,
+    getNavigationEngine: () => navigationEngine,
+    getMapController: () => mapController
+};
+
+console.log('✅ Mobile interface ready');
